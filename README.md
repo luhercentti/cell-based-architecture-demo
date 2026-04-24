@@ -6,13 +6,27 @@ A real-world implementation of Cell-Based Architecture on AWS using Terraform. U
 
 ## What is Cell-Based Architecture?
 
-Cell-Based Architecture is a design pattern where the system is divided into **independent, isolated units called "cells"**. Each cell is a complete infrastructure stack that serves a subset of tenants.
+Cell-Based Architecture is a design pattern where the system is divided into **independent, isolated units called "cells"**. Each cell is a complete infrastructure stack that serves **one or more tenants**.
+
+> **Important:** A cell does NOT mean one cell per tenant. A single cell typically serves many tenants simultaneously. The boundary is capacity, not identity.
 
 The core principle is **blast radius isolation**:
 
 > If cell-002 fails, **only the tenants assigned to cell-002 are affected**. Tenants in cell-001 continue operating normally, as if nothing happened.
 
 This contrasts with a monolithic or shared multi-tenant architecture, where a database or server failure affects **all** tenants simultaneously.
+
+**Cell assignment strategy:**
+
+| Tenant type | Assignment |
+|-------------|------------|
+| Small / standard tenant | Assigned to a shared cell alongside other tenants |
+| Large / high-traffic tenant | May fill an entire cell on its own |
+| Enterprise / compliance tenant | Gets a **dedicated cell** with zero shared resources |
+
+In a real platform like Shopify, one cell might serve thousands of small merchants. A major enterprise merchant (e.g., one running Black Friday campaigns) would get a dedicated cell — same Terraform module, just instantiated alone.
+
+In this POC: `cell-001` serves **tenant-acme** and **tenant-initech** (two standard tenants sharing a cell). `cell-002` serves **tenant-globex** (a tenant that could represent a larger or compliance-sensitive customer).
 
 ```
 Shared Architecture (traditional):           Cell-Based Architecture:
@@ -375,7 +389,7 @@ This removes **all** infrastructure created by this POC (no recurring costs once
 ## FAQ
 
 **How many tenants per cell?**
-It depends on the expected load per tenant. In this POC there is no limit. In production, cell capacity is monitored (CPU, throttles, latency) and tenants are migrated when a cell approaches its limit.
+Many — that is by design. A cell is an isolated capacity unit, not a per-tenant container. In production, a cell has a defined capacity budget (e.g., max Lambda concurrency, DynamoDB throughput). The cell-assignment service monitors each cell's utilization and stops routing new tenants to it when it approaches its limit. Tenants can also be migrated out to a new cell to rebalance. A tenant only gets a **dedicated cell** (1:1 mapping) when they are large enough to fill it alone, or when their SLA/compliance requirements demand zero noisy-neighbor risk.
 
 **What if the Cell Router fails?**
 The router is the single point of failure of the control plane. In production this is mitigated with: Lambda reserved concurrency, DynamoDB DAX (registry cache), and circuit breakers. Optionally, premium clients can be given their cell endpoint directly to bypass the router in an emergency.
