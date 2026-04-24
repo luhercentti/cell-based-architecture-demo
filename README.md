@@ -29,15 +29,78 @@ In a real platform like Shopify, one cell might serve thousands of small merchan
 In this POC: `cell-001` serves **tenant-acme** and **tenant-initech** (two standard tenants sharing a cell). `cell-002` serves **tenant-globex** (a tenant that could represent a larger or compliance-sensitive customer).
 
 ```
-Shared Architecture (traditional):           Cell-Based Architecture:
-
-   All tenants                                  tenant-acme   tenant-initech
-         ↓                                            ↓              ↓
-   [ API Gateway ]   ← fails →               [ Cell 001 ]  ← fails only here
-   [  Lambda   ]      all down               [ Cell 002 ]  ← stays healthy
-   [ DynamoDB  ]                                    ↑
-                                               tenant-globex
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Shared Architecture (traditional)     │  Cell-Based Architecture            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                        │                                     │
+│  tenant-acme                           │  tenant-acme   tenant-initech       │
+│  tenant-initech  ─────────────────┐   │       └──────────────┘              │
+│  tenant-globex                    ▼   │          [ Cell 001 ] ← 🔴 FAILS    │
+│                          [ API Gateway ]  │                                  │
+│                          [   Lambda   ]  │  tenant-globex                    │
+│                          [ DynamoDB   ] ←── 🔴 ONE failure                  │
+│                               │        │       └── [ Cell 002 ] ← 🟢 OK     │
+│                               ▼        │                                     │
+│                      ALL tenants down  │  Only cell-001 tenants affected     │
+│                      (100% blast radius│  cell-002 is completely unaffected  │
+│                       every time)      │  (bounded blast radius)             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### What happens when cell-001 degrades?
+
+If cell-001's Lambda starts throwing errors or its DynamoDB gets throttled:
+
+- **tenant-acme** → requests fail ❌
+- **tenant-initech** → requests fail ❌  (shares the same cell infrastructure)
+- **tenant-globex** → requests succeed ✅  (cell-002 is a completely separate stack — different Lambda, different DynamoDB, different API GW)
+
+> Both tenant-acme and tenant-initech are affected because they share the same cell-001 infrastructure. This is the **defined blast radius** of cell-001. It is bounded and predictable — the rest of the platform continues normally.
+
+### Why doesn't a tenant failure affect other tenants in the same cell?
+
+In cell-based architecture, what typically degrades is the **infrastructure** (Lambda concurrency, DynamoDB capacity), not one specific tenant. However, tenant data within a cell is still logically isolated:
+
+- Each tenant's data is stored under its own **partition key prefix**: `TENANT#acme/ORDER#...` vs `TENANT#initech/ORDER#...`
+- A DynamoDB query for `tenant-acme` **only reads `TENANT#acme` partitions** — it can never read or corrupt `TENANT#initech` data
+- If one tenant sends a malformed request that throws a Lambda error, that error is scoped to that specific request invocation — other tenants' concurrent requests are unaffected
+
+In short: **infrastructure failures** (throttling, Lambda errors) affect all tenants in the cell. **Data failures** (corrupt record, bad write) are scoped to that tenant's partition only.
+
+### How do you recover a degraded cell?
+
+**Option 1 — Fix the infrastructure in place** (for transient issues like a Lambda bug or cold start spike):
+
+```bash
+# Redeploy the cell's Lambda with a fix
+terraform apply -target=module.cell_001
+
+# Or just force a new Lambda deployment
+aws lambda update-function-code \
+  --function-name cell-poc-poc-cell-001-handler \
+  --zip-file fileb://terraform/lambda/cell/handler.zip
+```
+
+**Option 2 — Emergency: migrate tenants out of the degraded cell** (for severe or prolonged failures):
+
+1. Create a new healthy cell (`cell-003`) via `terraform apply`
+2. Update the Cell Registry to point affected tenants to cell-003:
+
+```hcl
+# In main.tf — update tenant-acme and tenant-initech to cell-003
+resource "aws_dynamodb_table_item" "tenant_acme" {
+  item = jsonencode({
+    tenant_id     = { S = "tenant-acme" }
+    cell_id       = { S = "cell-003" }   # ← redirected away from degraded cell-001
+    cell_endpoint = { S = module.cell_003.api_endpoint }
+    status        = { S = "active" }
+    assigned_at   = { S = "2026-04-24T00:00:00Z" }
+  })
+}
+```
+
+3. `terraform apply` — the router immediately starts sending traffic to cell-003. **No client-side change required.**
+4. Repair cell-001 offline, then migrate tenants back (or keep them in cell-003).
 
 ---
 
